@@ -10,7 +10,7 @@ import numpy as np
 
 from run_stories260k_tpu import GgufTokenizer, load_gguf_llama, parse_gguf
 from stories260k_tpu import Stories260KTPU
-from tpu_fpga import VLEN, TpuLlmFpga
+from tpu_fpga import MEM_WORDS, OP_GEMV, OP_ROPE, OP_WR, SEL_X, SEL_Y, SCRATCH, VLEN, WMEM_WORDS, TpuLlmFpga
 from tpu_llm_sim import TpuLlm
 
 ROOT = Path(__file__).resolve().parent
@@ -157,7 +157,40 @@ def main():
         reject(lambda: hw.rope(np.zeros(9), 1))
         reject(lambda: hw.vadd([1], [1,2]))
         reject(lambda: hw.linear([1], np.ones((2,2))))
-        print('PASS: host rejects out-of-range vector and GEMV shapes', flush=True)
+        reject(lambda: hw.linear(np.ones(MEM_WORDS[SEL_X]+1), np.ones((1, MEM_WORDS[SEL_X]+1))))
+        reject(lambda: hw.linear(np.ones(4), np.ones((MEM_WORDS[SEL_Y]+1, 4))))
+        reject(lambda: hw._store_weight(np.ones(WMEM_WORDS - SCRATCH + 1, dtype=np.float32)))
+        reject(lambda: hw._wr_words(SEL_X, MEM_WORDS[SEL_X] - 1, [0, 0]))
+        print('PASS: host rejects out-of-range vector and GEMV shapes, weights and writes', flush=True)
+
+        # The core and testbench refuse the same things when the host's checks are bypassed.
+        def refused(parts):
+            try:
+                hw._txn(parts)
+            except RuntimeError as e:
+                assert 'refused' in str(e), e
+                return
+            raise AssertionError(f'{parts} accepted')
+        refused([OP_GEMV, MEM_WORDS[SEL_Y] + 1, 4, 0])
+        refused([OP_GEMV, 4, MEM_WORDS[SEL_X] + 1, 0])
+        refused([OP_GEMV, 64, 64, WMEM_WORDS - 100])
+        refused([OP_ROPE, 9])
+        refused([OP_ROPE, VLEN + 2])
+        refused([OP_WR, SEL_X, MEM_WORDS[SEL_X] - 1, 2, 0, 0])
+        refused([99])
+        check('core still works after refusals', hw.vadd([1, 2], [3, 4]), [4, 6])
+        print('PASS: core and testbench refuse out-of-range commands', flush=True)
+
+        # NaN reaches every softmax output, as in NumPy (it used to be skipped by the max).
+        for z in ([1.0, np.nan, 2.0], [np.nan, 1.0], [1.0, 2.0, np.nan]):
+            check(f'softmax NaN {z}', hw.softmax(z), ref.softmax(z))
+        # Weights are cached by content: passing the same tensor again, even as a float64 copy,
+        # uploads nothing new.
+        wt = rng.normal(size=(40, 64)); heap = hw._heap
+        hw.linear(rng.normal(size=64), wt); used = hw._heap - heap
+        hw.linear(rng.normal(size=64), wt.astype(np.float64).copy())
+        assert used == wt.size and hw._heap - heap == used, (used, hw._heap - heap)
+        print('PASS: NaN softmax, content-keyed weight cache', flush=True)
 
         model = Stories260KTPU(cfg, w, tpu=hw)
         hc = nc = None; generated = []; maxerr = 0.0

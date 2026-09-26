@@ -13,6 +13,9 @@ import threading
 
 import numpy as np
 
+import time
+
+import tpu_fpga
 from tpu_fpga import SEL_X, TpuLlmFpga
 from tpu_llm_sim import TpuLlm, from_f32
 
@@ -51,6 +54,24 @@ def main():
         assert got.shape == (1,)
         tpu._wait_flag = wait_flag
     print("PASS: 40 preempted rounds (200+ transactions), no deadlock")
+
+    # A simulator that stops answering is reported within seconds, with what the host was doing,
+    # and killed.
+    tpu_fpga.TXN_BASE_S = 3.0
+    with TpuLlmFpga() as tpu:
+        pid = tpu._proc.pid
+        os.kill(pid, signal.SIGSTOP)
+        t0 = time.monotonic()
+        try:
+            tpu.vadd([1.0], [2.0])
+        except TimeoutError as e:
+            took = time.monotonic() - t0
+            assert "last command: VADD" in str(e) and "flag files:" in str(e), e
+            assert took < 10, took
+            assert tpu._proc is None, "vvp should be killed"
+        else:
+            raise AssertionError("a stopped simulator went unnoticed")
+    print(f"PASS: a hung simulator is reported after {took:.0f}s, with its state, and killed")
 
 
 if __name__ == "__main__":
