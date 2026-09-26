@@ -57,6 +57,11 @@ package tpu_fp32_pkg;
         end
     endfunction
 
+    function automatic is_nan;
+        input [31:0] a;
+        begin is_nan = a[30:23] == 8'hff && a[22:0] != 0; end
+    endfunction
+
     function automatic [31:0] fp32_add;
         input [31:0] a, b;
         begin fp32_add = real_to_fp32(fp32_to_real(a) + fp32_to_real(b)); end
@@ -139,20 +144,21 @@ module tpu_fpga (
     input  wire [31:0] host_wdata,
     output reg  [31:0] host_rdata,
     output reg         busy,
-    output reg         done
+    output reg         done,
+    output reg         error     // with done: the command's arguments were out of range; nothing ran
 );
     import tpu_fp32_pkg::*;
 
-    localparam OP_GEMV      = 4'd1;
-    localparam OP_VADD      = 4'd2;
-    localparam OP_VMUL      = 4'd3;
-    localparam OP_VMUL_ELEM = 4'd4;
-    localparam OP_SILU      = 4'd5;
-    localparam OP_RMSNORM   = 4'd6;
-    localparam OP_SOFTMAX   = 4'd7;
-    localparam OP_ROPE      = 4'd8;
+    localparam OP_GEMV      = `OP_GEMV;
+    localparam OP_VADD      = `OP_VADD;
+    localparam OP_VMUL      = `OP_VMUL;
+    localparam OP_VMUL_ELEM = `OP_VMUL_ELEM;
+    localparam OP_SILU      = `OP_SILU;
+    localparam OP_RMSNORM   = `OP_RMSNORM;
+    localparam OP_SOFTMAX   = `OP_SOFTMAX;
+    localparam OP_ROPE      = `OP_ROPE;
 
-    localparam SEL_W = 3'd0, SEL_X = 3'd1, SEL_Y = 3'd2, SEL_G = 3'd3, SEL_A = 3'd4;
+    localparam SEL_W = `SEL_W, SEL_X = `SEL_X, SEL_Y = `SEL_Y, SEL_G = `SEL_G, SEL_A = `SEL_A;
 
     localparam S_IDLE   = 4'd0;
     localparam S_FETCH  = 4'd1;
@@ -178,6 +184,13 @@ module tpu_fpga (
     reg [15:0] m_reg, k_reg, len_reg, idx, row0, k0, work_len;
     reg [31:0] wbase, aux_reg, acc;
     reg [31:0] sumsq, maxv, inv, scale;
+
+    // A command's arguments must fit the memories it touches, or it would read or write out of
+    // range. The host checks them too; this is the last line of defence.
+    wire [47:0] gemv_end = {16'b0, arg_addr} + arg_m * arg_k;
+    wire gemv_bad = arg_m > `YMEM_WORDS || arg_k > `XMEM_WORDS || gemv_end > `WMEM_WORDS;
+    wire vec_bad  = arg_len > VLEN || (opcode == OP_ROPE && arg_len[0]);
+    wire op_known = opcode >= OP_GEMV && opcode <= OP_ROPE;
 
     always @(posedge clk) begin
         if (host_en && host_we) begin
@@ -206,6 +219,7 @@ module tpu_fpga (
             state <= S_IDLE;
             busy  <= 1'b0;
             done  <= 1'b0;
+            error <= 1'b0;
             idx   <= 0;
             row0  <= 0;
             k0    <= 0;
@@ -226,7 +240,10 @@ module tpu_fpga (
                     k0      <= 0;
                     acc     <= 0;
                     sumsq   <= 0;
-                    if (opcode == 4'd0 || arg_len == 0 && opcode != OP_GEMV)
+                    error   <= !op_known || (opcode == OP_GEMV ? gemv_bad : vec_bad);
+                    if (!op_known || (opcode == OP_GEMV ? gemv_bad : vec_bad))
+                        state <= S_DONE;
+                    else if (arg_len == 0 && opcode != OP_GEMV)
                         state <= S_DONE;
                     else if (opcode == OP_GEMV)
                         state <= (arg_m == 0 || arg_k == 0) ? S_DONE : S_FETCH;
@@ -311,7 +328,9 @@ module tpu_fpga (
                             maxv <= x_mem[0];
                             idx  <= 16'd1;
                         end else if (idx < work_len) begin
-                            if (fp32_to_real(x_mem[idx]) > fp32_to_real(maxv))
+                            // A NaN wins and stays, so it reaches every output, as in NumPy.
+                            if (!is_nan(maxv) && (is_nan(x_mem[idx]) ||
+                                                  fp32_to_real(x_mem[idx]) > fp32_to_real(maxv)))
                                 maxv <= x_mem[idx];
                             idx <= idx + 16'd1;
                         end else begin
@@ -335,7 +354,7 @@ module tpu_fpga (
                             sumsq <= fp32_add(sumsq, fp32_exp(fp32_sub(x_mem[idx], maxv)));
                             idx   <= idx + 16'd1;
                         end else begin
-                            inv   <= (sumsq == 0) ? 32'h3f800000 : fp32_div(32'h3f800000, sumsq);
+                            inv   <= fp32_div(32'h3f800000, sumsq);  // the max lane adds exp(0) = 1, so 0 can't occur
                             idx   <= 0;
                             state <= S_NORM;
                         end

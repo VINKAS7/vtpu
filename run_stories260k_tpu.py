@@ -5,13 +5,14 @@ import argparse
 import re
 import struct
 import sys
+import time
 from pathlib import Path
 
 HOST = Path(__file__).resolve().parent
 sys.path.insert(0, str(HOST))
 
 from stories260k_tpu import Stories260KConfig, Stories260KTPU
-from tpu_fpga import TpuLlmFpga
+from tpu_fpga import CLOCK_HZ, TpuLlmFpga
 from tpu_llm_sim import TpuLlm
 
 DEFAULT_GGUF = HOST / "stories260K.gguf"
@@ -253,13 +254,29 @@ def main():
     print("prompt:", args.prompt, flush=True)
     print("prompt ids:", ids, flush=True)
     try:
+        c0 = tpu.cycles() if hasattr(tpu, "cycles") else None
+        t0 = time.monotonic()
         out = model.generate(ids, args.max_new_tokens, eos=tok.eos_token_id)
+        wall = time.monotonic() - t0
+        c1 = tpu.cycles() if c0 else None
     finally:
         if hasattr(tpu, "close"):
             tpu.close()
+    n = len(out) - len(ids)
     print("generated ids:", out[len(ids):], flush=True)
     print("text:", tok.decode(out), flush=True)
     print("tpu cmds:", tpu.summary(), flush=True)
+    if n:
+        print(f"speed: {n} tokens in {wall:.1f} s on this machine, {n / wall:.2f} tokens/s", flush=True)
+    if n and c0:
+        busy, total = (b - a for a, b in zip(c0, c1))
+        print(f"cycles per token: {busy / n:,.0f} with the core running, {total / n:,.0f} with the host "
+              f"port's transfers too. The simulation ran {total / wall / 1e3:,.1f}k of these cycles per second "
+              f"on this machine.",
+              flush=True)
+        print(f"  (the testbench's nominal clock is {CLOCK_HZ / 1e6:.0f} MHz, but the core isn't synthesized "
+              f"and has no real clock yet; at {CLOCK_HZ / 1e6:.0f} MHz, {busy / n:,.0f} cycles would be "
+              f"{CLOCK_HZ * n / busy:,.0f} tokens/s)", flush=True)
 
 
 if __name__ == "__main__":
